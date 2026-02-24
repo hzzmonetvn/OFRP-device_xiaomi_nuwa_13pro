@@ -1,0 +1,158 @@
+name: Pitch Black Recovery Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      MANIFEST_URL:
+        description: 'Manifest URL'
+        required: true
+        default: 'https://github.com/PitchBlackRecoveryProject/manifest_pb'
+      MANIFEST_BRANCH:
+        description: 'Manifest Branch'
+        required: true
+        default: 'android-12.1'
+      DEVICE_TREE_URL:
+        description: 'Device Tree URL'
+        required: true
+        default: 'https://github.com/hzzmonetvn/android_device_xiaomi_nuwa'
+      DEVICE_TREE_BRANCH:
+        description: 'Device Tree Branch'
+        required: true
+        default: 'pb'
+      DEVICE_PATH:
+        description: 'Device Path'
+        required: true
+        default: 'device/xiaomi/nuwa'
+      COMMON_TREE_URL:
+        description: 'Common Tree URL (optional)'
+        required: false
+      COMMON_TREE_BRANCH:
+        description: 'Common Tree Branch (optional)'
+        required: false
+      COMMON_PATH:
+        description: 'Common Path (optional)'
+        required: false
+      DEVICE_NAME:
+        description: 'Device Codename'
+        required: true
+        default: 'nuwa'
+      MAKEFILE_NAME:
+        description: 'Lunch Target Name'
+        required: true
+        default: 'pb_nuwa'
+      BUILD_TARGET:
+        description: 'Build Target (recovery/vendorboot/etc)'
+        required: true
+        default: 'recovery'
+
+jobs:
+  build:
+    if: github.event.repository.owner.id == github.event.sender.id
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Cleanup Runner
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /usr/local/lib/android
+        sudo docker image prune -a -f
+
+    - name: Install Dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y \
+          git-core gnupg flex bison build-essential zip curl zlib1g-dev \
+          gcc-multilib g++-multilib libc6-dev-i386 lib32ncurses5-dev \
+          x11proto-core-dev libx11-dev lib32z1-dev libgl1-mesa-dev \
+          libxml2-utils xsltproc unzip fontconfig \
+          openjdk-11-jdk repo ccache bc
+
+    - name: Setup Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'zulu'
+        java-version: '11'
+
+    - name: Enable ccache
+      run: |
+        echo "USE_CCACHE=1" >> $GITHUB_ENV
+        echo "CCACHE_EXEC=/usr/bin/ccache" >> $GITHUB_ENV
+        ccache -M 10G
+
+    - name: Cache ccache
+      uses: actions/cache@v4
+      with:
+        path: ~/.ccache
+        key: ${{ runner.os }}-ccache-${{ github.ref }}
+        restore-keys: |
+          ${{ runner.os }}-ccache-
+
+    - name: Setup SSH (if needed)
+      if: ${{ startsWith(github.event.inputs.MANIFEST_URL, 'git@') || startsWith(github.event.inputs.DEVICE_TREE_URL, 'git@') || startsWith(github.event.inputs.COMMON_TREE_URL, 'git@') }}
+      uses: webfactory/ssh-agent@v0.9.0
+      with:
+        ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+    - name: Init Repo
+      run: |
+        mkdir workspace
+        cd workspace
+        git config --global user.name "github-actions"
+        git config --global user.email "actions@github.com"
+        repo init --depth=1 -u ${{ github.event.inputs.MANIFEST_URL }} -b ${{ github.event.inputs.MANIFEST_BRANCH }}
+
+    - name: Repo Sync
+      run: |
+        cd workspace
+        repo sync -c --no-clone-bundle --no-tags -j$(nproc --all) --force-sync
+
+    - name: Clone Device Tree
+      run: |
+        cd workspace
+        git clone ${{ github.event.inputs.DEVICE_TREE_URL }} \
+          -b ${{ github.event.inputs.DEVICE_TREE_BRANCH }} \
+          ./${{ github.event.inputs.DEVICE_PATH }}
+
+    - name: Clone Common Tree (Optional)
+      if: ${{ github.event.inputs.COMMON_TREE_URL != '' && github.event.inputs.COMMON_PATH != '' }}
+      run: |
+        cd workspace
+        git clone ${{ github.event.inputs.COMMON_TREE_URL }} \
+          -b ${{ github.event.inputs.COMMON_TREE_BRANCH }} \
+          ./${{ github.event.inputs.COMMON_PATH }}
+
+    - name: Set Swap (16GB)
+      uses: pierotofy/set-swap-space@master
+      with:
+        swap-size-gb: 16
+
+    - name: Build Recovery
+      run: |
+        cd workspace
+        source build/envsetup.sh
+        export ALLOW_MISSING_DEPENDENCIES=true
+        lunch ${{ github.event.inputs.MAKEFILE_NAME }}-eng
+        make clean
+        make -j$(nproc --all) ${{ github.event.inputs.BUILD_TARGET }}image
+
+    - name: Upload to Release
+      uses: softprops/action-gh-release@v2
+      with:
+        name: ${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}
+        tag_name: ${{ github.run_id }}
+        body: |
+          Manifest: ${{ github.event.inputs.MANIFEST_BRANCH }}
+          Device: ${{ github.event.inputs.DEVICE_NAME }}
+          Target: ${{ github.event.inputs.BUILD_TARGET }}.img
+        files: |
+          workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/${{ github.event.inputs.BUILD_TARGET }}.img
+          workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
+          workspace/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*vendor*.img
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
